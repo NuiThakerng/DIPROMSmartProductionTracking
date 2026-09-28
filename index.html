@@ -1,372 +1,540 @@
-/**
- * DIPROM Smart Production Tracking - Backend API
- * สถาปัตยกรรม: Google Apps Script Web App -> REST API
- * (นำระบบแจ้งเตือนไลน์ออก และเพิ่มระบบป้องกันการกด Run ผิดพลาดจาก Editor)
- */
-
-const SPREADSHEET_ID = SpreadsheetApp.getActiveSpreadsheet().getId();
-
-// ==========================================
-// 1. ROUTING (API ENTRY POINTS)
-// ==========================================
-
-function doGet(e) {
-  // ระบบป้องกัน: หากเผลอกดปุ่ม Run (เรียกใช้) doGet จากหน้าต่าง Editor โดยตรง จะไม่ให้เกิด Error พัง
-  if (!e || !e.parameter) {
-    return ContentService.createTextOutput("✅ ระบบ Backend ทำงานปกติ! \n\n(หมายเหตุ: การใช้งาน API นี้ต้องเรียกผ่าน Frontend Web App เท่านั้น ไม่สามารถกด 'เรียกใช้' จากหน้าจอนี้โดยตรงได้ครับ)")
-      .setMimeType(ContentService.MimeType.TEXT);
-  }
-
-  const action = e.parameter.action;
-  let result = {};
-
-  try {
-    if (action === "getVegetables") {
-      result = getTableData("Vegetable_Master");
-    } else if (action === "getDashboard") {
-      const period = e.parameter.period || "all";
-      result = calculateDashboardData(period);
-    } else if (action === "getLots") {
-      const page = parseInt(e.parameter.page) || 1;
-      const pageSize = parseInt(e.parameter.pageSize) || 20;
-      const period = e.parameter.period || "all";
-      result = getLotsPaginated(page, pageSize, period);
-    } else if (action === "getSupplierRankings") {
-      result = getSupplierRankings();
-    } else {
-      result = { status: "error", message: "Invalid GET action" };
-    }
-  } catch (err) {
-    result = { status: "error", message: err.toString() };
-  }
-
-  return ContentService.createTextOutput(JSON.stringify(result))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-function doPost(e) {
-  // ระบบป้องกันการกด Run doPost ผ่าน Editor
-  if (!e || !e.postData) {
-    return ContentService.createTextOutput("✅ Endpoint สำหรับ POST พร้อมทำงาน (ห้ามกด Run ผ่าน Editor)")
-      .setMimeType(ContentService.MimeType.TEXT);
-  }
-
-  let response = {};
-
-  try {
-    const data = JSON.parse(e.postData.contents);
-    const action = data.action;
-
-    if (action === "createLot") {
-      response = createProductionLot(data.payload);
-    } else if (action === "completeLot") {
-      response = finishProductionLot(data.payload);
-    } else if (action === "deleteLot") {
-      response = deleteRowById("Production_Lots", "lot_id", data.lot_id);
-    } else if (action === "saveVegetable") {
-      response = upsertVegetable(data.payload);
-    } else if (action === "deleteVegetable") {
-      response = deleteRowById("Vegetable_Master", "veg_id", data.veg_id);
-    } else {
-      response = { status: "error", message: "Invalid POST action" };
-    }
-  } catch (err) {
-    response = { status: "error", message: err.toString() };
-  }
-
-  return ContentService.createTextOutput(JSON.stringify(response))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-
-// ==========================================
-// 2. จัดการข้อมูลชนิดผัก & DYNAMIC THRESHOLD
-// ==========================================
-
-function getVegStandardYield(vegId) {
-  try {
-    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName("Vegetable_Master");
-    if (!sheet) return 50.0;
-
-    const data = sheet.getDataRange().getValues();
-    if (data.length <= 1) return 50.0;
-
-    for (let i = 1; i < data.length; i++) {
-      if (String(data[i][0]).trim() === String(vegId).trim()) {
-        const val = Number(data[i][2]);
-        return isNaN(val) || val <= 0 ? 50.0 : val;
-      }
-    }
-  } catch (err) {}
-  return 50.0;
-}
-
-function evaluateSupplierGradeDynamic(actualYield, standardYield) {
-  const actual = Number(actualYield);
-  const std = Number(standardYield);
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DIPROM Smart Production Tracking</title>
   
-  if (actual >= (std + 5.0)) return { grade: "A", status: "ดีเยี่ยม (เหนือเกณฑ์)" };
-  if (actual >= std) return { grade: "B", status: "มาตรฐาน (ผ่านเกณฑ์)" };
-  return { grade: "C", status: "ต่ำกว่าเกณฑ์มาตรฐาน" };
-}
+  <!-- Libraries -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/html5-qrcode"></script>
 
-function upsertVegetable(p) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName("Vegetable_Master");
-  const data = sheet.getDataRange().getValues();
+  <style>
+    body { font-family: 'Sarabun', sans-serif; }
+    .loader { border: 3px solid #f3f3f3; border-top: 3px solid #10b981; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; display: none; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800">
 
-  const vegId = p.veg_id;
-  const vegName = p.veg_name;
-  const standardYield = Number(p.standard_yield_min) || 50.0;
+  <!-- Navbar -->
+  <nav class="bg-emerald-700 text-white px-6 py-4 shadow-md flex justify-between items-center sticky top-0 z-50">
+    <h1 class="text-xl font-bold tracking-wide">🥦 DIPROM Smart Tracking</h1>
+    <div class="space-x-4 text-sm hidden md:block">
+      <button onclick="switchTab('dashboard')" class="hover:text-emerald-200 transition">แดชบอร์ด</button>
+      <button onclick="switchTab('lots')" class="hover:text-emerald-200 transition">Lot การผลิต</button>
+      <button onclick="switchTab('master')" class="hover:text-emerald-200 transition">ข้อมูลชนิดผัก (Admin)</button>
+    </div>
+    <div class="loader" id="globalLoader"></div>
+  </nav>
 
-  if (vegId) {
-    for (let i = 1; i < data.length; i++) {
-      if (String(data[i][0]).trim() === String(vegId).trim()) {
-        sheet.getRange(i + 1, 2, 1, 3).setValues([[vegName, standardYield, true]]);
-        return { status: "success", message: "Updated", veg_id: vegId };
+  <main class="max-w-7xl mx-auto p-4 md:p-6 pb-20">
+    
+    <!-- ==================== TAB 1: แดชบอร์ด ==================== -->
+    <section id="sec-dashboard" class="space-y-6">
+      <div class="flex justify-between items-center">
+        <h2 class="text-2xl font-bold text-slate-700">ภาพรวมการผลิต (Dashboard)</h2>
+      </div>
+
+      <!-- สรุปตัวเลข KPI -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="bg-white p-5 rounded-xl shadow-sm border-l-4 border-slate-500">
+          <p class="text-xs text-slate-500 uppercase tracking-wide">ผักดิบเข้าผลิตรวม</p>
+          <h3 id="cardTotalRaw" class="text-2xl font-bold mt-1">0 kg</h3>
+        </div>
+        <div class="bg-white p-5 rounded-xl shadow-sm border-l-4 border-emerald-500">
+          <p class="text-xs text-emerald-600 font-semibold uppercase tracking-wide">ผักดีที่ได้</p>
+          <h3 id="cardTotalGood" class="text-2xl font-bold text-emerald-600 mt-1">0 kg</h3>
+        </div>
+        <div class="bg-white p-5 rounded-xl shadow-sm border-l-4 border-rose-500">
+          <p class="text-xs text-rose-500 font-semibold uppercase tracking-wide">ของเสีย (Waste)</p>
+          <h3 id="cardTotalWaste" class="text-2xl font-bold text-rose-500 mt-1">0 kg</h3>
+        </div>
+        <div class="bg-white p-5 rounded-xl shadow-sm border-l-4 border-blue-500">
+          <p class="text-xs text-blue-600 font-semibold uppercase tracking-wide">% Yield เฉลี่ย</p>
+          <h3 id="cardOverallYield" class="text-2xl font-bold text-blue-600 mt-1">0%</h3>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <!-- กราฟเปรียบเทียบ -->
+        <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-100">
+          <h4 class="font-bold mb-4 text-slate-700">สัดส่วนผลผลิต vs ของเสีย (ตามชนิดผัก)</h4>
+          <canvas id="yieldChart" height="250"></canvas>
+        </div>
+
+        <!-- จัดอันดับ -->
+        <div class="bg-white p-5 rounded-xl shadow-sm border border-slate-100 flex flex-col gap-6">
+          <div>
+            <h4 class="font-bold mb-2 text-slate-700 flex justify-between">
+              <span>🏆 จัดอันดับยอดการผลิตสูงสุด</span>
+            </h4>
+            <ul id="topProdList" class="text-sm divide-y text-slate-600"></ul>
+          </div>
+          <div>
+            <h4 class="font-bold mb-2 text-slate-700 flex justify-between">
+              <span>🥇 จัดอันดับ Supplier ส่งมอบวัตถุดิบคุณภาพ (ตาม Yield)</span>
+            </h4>
+            <ul id="supplierRankList" class="text-sm divide-y text-slate-600"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2: Lot การผลิต ==================== -->
+    <section id="sec-lots" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <h2 class="text-2xl font-bold text-slate-700">รายการ Lot การผลิต</h2>
+        <button onclick="openModalCreateLot()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg shadow font-medium">
+          + เปิด Lot ใหม่
+        </button>
+      </div>
+
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+        <table class="w-full text-left text-sm whitespace-nowrap">
+          <thead class="bg-slate-50 text-slate-600 uppercase text-xs font-semibold border-b">
+            <tr>
+              <th class="p-3">Lot ID</th>
+              <th class="p-3">ชนิดผัก</th>
+              <th class="p-3">ผักดิบ (kg)</th>
+              <th class="p-3">ผักดี (kg)</th>
+              <th class="p-3">ของเสีย (kg)</th>
+              <th class="p-3">%Yield</th>
+              <th class="p-3">เกรด</th>
+              <th class="p-3 text-center">จัดการ</th>
+            </tr>
+          </thead>
+          <tbody id="lotTableBody" class="divide-y text-slate-700"></tbody>
+        </table>
+      </div>
+
+      <div class="flex justify-between items-center text-sm font-medium text-slate-600">
+        <span id="pageInfo">แสดงหน้า 1 จาก 1</span>
+        <div class="space-x-2">
+          <button onclick="changePage(-1)" class="px-4 py-2 bg-white border rounded shadow-sm hover:bg-slate-50">ก่อนหน้า</button>
+          <button onclick="changePage(1)" class="px-4 py-2 bg-white border rounded shadow-sm hover:bg-slate-50">ถัดไป</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 3: ข้อมูลชนิดผัก (Admin) ==================== -->
+    <section id="sec-master" class="space-y-6 hidden">
+      <div class="flex justify-between items-center">
+        <div>
+          <h2 class="text-2xl font-bold text-slate-700">เกณฑ์มาตรฐาน (Dynamic Threshold)</h2>
+          <p class="text-sm text-slate-500 mt-1">กำหนด %Yield ขั้นต่ำที่ยอมรับได้สำหรับผักแต่ละชนิด</p>
+        </div>
+        <button onclick="openVegModal()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg shadow font-medium">
+          + เพิ่มชนิดผักใหม่
+        </button>
+      </div>
+
+      <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+        <table class="w-full text-left text-sm">
+          <thead class="bg-slate-50 text-slate-600 uppercase text-xs border-b">
+            <tr>
+              <th class="p-3">ชื่อผัก</th>
+              <th class="p-3">เกณฑ์ Yield ขั้นต่ำ (%)</th>
+              <th class="p-3 text-center">จัดการ</th>
+            </tr>
+          </thead>
+          <tbody id="vegMasterTableBody" class="divide-y text-slate-700"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ==================== MODALS ==================== -->
+
+  <!-- Modal: สร้าง Lot ใหม่ -->
+  <div id="modalLot" class="fixed inset-0 bg-black/60 hidden flex items-center justify-center p-4 z-50">
+    <div class="bg-white rounded-xl p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto">
+      <h3 class="text-xl font-bold mb-4">เปิด Lot ตัดแต่งผัก</h3>
+      
+      <div class="grid grid-cols-2 gap-4 mb-4">
+        <div>
+          <label class="block text-xs font-semibold mb-1 text-slate-500">ชนิดผักที่จะตัดแต่ง</label>
+          <select id="newLotVeg" class="w-full border p-2.5 rounded-lg bg-slate-50"></select>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold mb-1 text-slate-500">จำนวนคนงาน (คน)</label>
+          <input type="number" id="newLotWorkers" value="1" min="1" class="w-full border p-2.5 rounded-lg bg-slate-50">
+        </div>
+      </div>
+
+      <!-- สแกน/กรอก ตะกร้า 8 หลัก -->
+      <div class="bg-slate-50 p-4 rounded-lg border border-slate-200 mb-4">
+        <h4 class="font-bold text-sm mb-3">สแกนรหัสตะกร้า 8 หลัก</h4>
+        <div id="qr-reader" class="w-full max-w-[250px] mx-auto mb-3 rounded overflow-hidden"></div>
+        
+        <div class="grid grid-cols-2 md:grid-cols-3 gap-2 mb-2">
+          <input type="text" id="basketInput" maxlength="8" placeholder="รหัสตะกร้า 8 หลัก" class="border p-2 rounded text-sm md:col-span-1 col-span-2">
+          <input type="text" id="supplierInput" placeholder="ชื่อ Supplier" class="border p-2 rounded text-sm">
+          <input type="number" id="weightInput" placeholder="นน. (kg)" class="border p-2 rounded text-sm">
+        </div>
+        <button onclick="addBasketItem()" class="w-full bg-slate-200 hover:bg-slate-300 text-slate-700 py-2 rounded-lg text-sm font-bold transition">
+          + เพิ่มตะกร้าเข้าระบบ
+        </button>
+
+        <div class="mt-3 max-h-32 overflow-y-auto">
+          <table class="w-full text-xs text-left">
+            <tbody id="basketTempList" class="divide-y divide-slate-200"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="flex justify-end space-x-3">
+        <button onclick="closeModalCreateLot()" class="px-5 py-2.5 border rounded-lg font-medium">ยกเลิก</button>
+        <button onclick="submitNewLot()" class="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-medium">บันทึกเปิด Lot</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: เพิ่ม/แก้ไข ข้อมูลผัก -->
+  <div id="modalVeg" class="fixed inset-0 bg-black/60 hidden flex items-center justify-center p-4 z-50">
+    <div class="bg-white rounded-xl p-6 max-w-sm w-full">
+      <h3 id="vegModalTitle" class="text-lg font-bold mb-4">จัดการชนิดผัก</h3>
+      <input type="hidden" id="vegIdInput">
+      <div class="space-y-4 mb-5">
+        <div>
+          <label class="block text-xs font-semibold mb-1 text-slate-500">ชื่อผัก</label>
+          <input type="text" id="vegNameInput" class="w-full border p-2.5 rounded-lg bg-slate-50">
+        </div>
+        <div>
+          <label class="block text-xs font-semibold mb-1 text-slate-500">เกณฑ์ Yield ขั้นต่ำ (%)</label>
+          <input type="number" id="vegYieldMinInput" step="0.1" class="w-full border p-2.5 rounded-lg bg-slate-50">
+        </div>
+      </div>
+      <div class="flex justify-end space-x-2">
+        <button onclick="closeVegModal()" class="px-4 py-2 border rounded-lg font-medium">ยกเลิก</button>
+        <button onclick="submitVegForm()" class="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium">บันทึก</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mobile Bottom Menu -->
+  <div class="md:hidden fixed bottom-0 w-full bg-white border-t flex justify-around p-3 pb-safe shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] z-40">
+    <button onclick="switchTab('dashboard')" class="text-xs font-bold text-slate-500 hover:text-emerald-600 flex flex-col items-center">📊<span class="mt-1">แดชบอร์ด</span></button>
+    <button onclick="switchTab('lots')" class="text-xs font-bold text-slate-500 hover:text-emerald-600 flex flex-col items-center">📦<span class="mt-1">Lot ผลิต</span></button>
+    <button onclick="switchTab('master')" class="text-xs font-bold text-slate-500 hover:text-emerald-600 flex flex-col items-center">⚙️<span class="mt-1">ตั้งค่า</span></button>
+  </div>
+
+  <script>
+    // 🔴🔴🔴 นำ URL ของ Web App มาวางที่นี่ 🔴🔴🔴
+    const API_URL = "https://script.google.com/macros/s/AKfycby5EGE6jW4g4u0ekJlVheFdZn_dZ505dYlBVe-EwCvWTu01PMKbed-2I6f8Xwc1hi6w/exec";
+    
+    let currentPage = 1;
+    let tempBaskets = [];
+    let html5QrScanner = null;
+    let chartInstance = null;
+    let vegListMaster = []; // เก็บตัวเลือกผัก
+
+    function showLoader() { document.getElementById('globalLoader').style.display = 'block'; }
+    function hideLoader() { document.getElementById('globalLoader').style.display = 'none'; }
+
+    // การสลับหน้า (Tabs)
+    function switchTab(tab) {
+      document.getElementById('sec-dashboard').classList.add('hidden');
+      document.getElementById('sec-lots').classList.add('hidden');
+      document.getElementById('sec-master').classList.add('hidden');
+      
+      document.getElementById(`sec-${tab}`).classList.remove('hidden');
+      
+      if (tab === 'dashboard') loadDashboard();
+      if (tab === 'lots') { loadLots(currentPage); loadVegDropdown(); }
+      if (tab === 'master') loadVegetableMaster();
+    }
+
+    // ==========================================
+    // API CALLS (ฟังก์ชันดึงข้อมูล)
+    // ==========================================
+
+    async function apiRequest(url, method = 'GET', payload = null) {
+      showLoader();
+      try {
+        const options = { method: method };
+        if (method === 'POST') {
+          options.body = JSON.stringify(payload);
+        }
+        const res = await fetch(url, options);
+        return await res.json();
+      } catch (err) {
+        alert("การเชื่อมต่อมีปัญหา กรุณาลองใหม่");
+        console.error(err);
+      } finally {
+        hideLoader();
       }
     }
-  }
 
-  const newVegId = "VEG-" + Utilities.formatDate(new Date(), "GMT+7", "yyyyMMdd-HHmmss");
-  sheet.appendRow([newVegId, vegName, standardYield, true]);
-  return { status: "success", message: "Created", veg_id: newVegId };
-}
+    // ==========================================
+    // 1. DASHBOARD CONTROLLER
+    // ==========================================
+    
+    async function loadDashboard() {
+      const data = await apiRequest(`${API_URL}?action=getDashboard`);
+      if(!data || data.status !== 'success') return;
 
-// ==========================================
-// 3. จัดการ LOT การผลิต (เปิด LOT / ชั่งปิดยอด)
-// ==========================================
+      document.getElementById('cardTotalRaw').innerText = `${data.summary.totalRaw} kg`;
+      document.getElementById('cardTotalGood').innerText = `${data.summary.totalGood} kg`;
+      document.getElementById('cardTotalWaste').innerText = `${data.summary.totalWaste} kg`;
+      document.getElementById('cardOverallYield').innerText = `${data.summary.overallYield}%`;
 
-function createProductionLot(p) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const lotSheet = ss.getSheetByName("Production_Lots");
-  const basketSheet = ss.getSheetByName("Lot_Input_Baskets");
+      renderChart(data.vegChartData);
 
-  const lotId = "LOT-" + Utilities.formatDate(new Date(), "GMT+7", "yyyyMMdd-HHmmss");
-  let totalRawWeight = 0;
+      // Top Produced
+      const topHtml = data.topProduced.slice(0,5).map((v, i) => `
+        <li class="py-2 flex justify-between items-center">
+          <span>${i+1}. ${v.name}</span> <span class="font-bold text-slate-700">${v.raw.toFixed(1)} kg</span>
+        </li>
+      `).join('');
+      document.getElementById('topProdList').innerHTML = topHtml || '<li class="py-2 text-center text-slate-400">ยังไม่มีข้อมูล</li>';
 
-  if (p.baskets && Array.isArray(p.baskets)) {
-    p.baskets.forEach(b => {
-      const wt = Number(b.raw_weight) || 0;
-      totalRawWeight += wt;
-      basketSheet.appendRow([
-        Utilities.getUuid(), lotId, String(b.basket_code).trim(), b.supplier_name, wt, new Date().toISOString()
-      ]);
-    });
-  }
+      // Load Supplier Ranking
+      const supData = await apiRequest(`${API_URL}?action=getSupplierRankings`);
+      if(supData && supData.status === 'success') {
+        const supHtml = supData.data.slice(0,5).map((s, i) => `
+          <li class="py-2 flex justify-between items-center">
+            <span>${i+1}. ${s.supplier_name}</span> 
+            <div>
+              <span class="text-xs px-2 py-0.5 rounded mr-2 ${s.grade==='A'?'bg-emerald-100 text-emerald-700':s.grade==='B'?'bg-amber-100 text-amber-700':'bg-rose-100 text-rose-700'}">เกรด ${s.grade}</span>
+              <span class="font-bold">${s.avg_yield_pct}%</span>
+            </div>
+          </li>
+        `).join('');
+        document.getElementById('supplierRankList').innerHTML = supHtml || '<li class="py-2 text-center text-slate-400">ยังไม่มีข้อมูล</li>';
+      }
+    }
 
-  lotSheet.appendRow([
-    lotId, p.veg_id, p.veg_name, new Date().toISOString(), "",
-    Number(p.workers_count) || 1, totalRawWeight, 0, 0, 0, 0, 0, 0, "IN_PROGRESS"
-  ]);
+    function renderChart(chartData) {
+      const ctx = document.getElementById('yieldChart').getContext('2d');
+      if (chartInstance) chartInstance.destroy(); // ลบกราฟเก่าก่อนวาดใหม่
 
-  return { status: "success", lot_id: lotId };
-}
+      const labels = chartData.map(d => d.name);
+      const dataGood = chartData.map(d => d.good);
+      const dataWaste = chartData.map(d => d.waste);
 
-function finishProductionLot(p) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const lotSheet = ss.getSheetByName("Production_Lots");
-  const data = lotSheet.getDataRange().getValues();
+      chartInstance = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [
+            { label: 'ผักดี (kg)', data: dataGood, backgroundColor: '#10b981', stack: 'Stack 0' },
+            { label: 'ของเสีย (kg)', data: dataWaste, backgroundColor: '#f43f5e', stack: 'Stack 0' }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: { x: { stacked: true }, y: { stacked: true } }
+        }
+      });
+    }
 
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][0] === p.lot_id) {
-      const vegId = data[i][1];
-      const rawWeight = Number(data[i][6]);
-      const workers = Number(data[i][5]);
-      const startTime = new Date(data[i][3]);
-      const endTime = new Date();
-      const hours = Math.max((endTime - startTime) / (1000 * 60 * 60), 0.1);
+    // ==========================================
+    // 2. LOT CONTROLLER & SCANNER
+    // ==========================================
 
-      const goodWeight = Number(p.good_weight);
-      const wasteWeight = Number(p.waste_weight);
-      const diff = (goodWeight + wasteWeight) - rawWeight;
-      const yieldPct = rawWeight > 0 ? (goodWeight / rawWeight) * 100 : 0;
-      const rate = goodWeight / hours;
-      const efficiency = workers > 0 ? goodWeight / (workers * hours) : 0;
+    async function loadLots(page) {
+      const data = await apiRequest(`${API_URL}?action=getLots&page=${page}&pageSize=20`);
+      if(!data || data.status !== 'success') return;
 
-      const standardYieldMin = getVegStandardYield(vegId);
-      const gradeResult = evaluateSupplierGradeDynamic(yieldPct, standardYieldMin);
+      const tbody = document.getElementById('lotTableBody');
+      tbody.innerHTML = data.data.map(r => `
+        <tr class="hover:bg-slate-50 transition">
+          <td class="p-3 font-mono font-bold text-slate-600">${r.lot_id.replace('LOT-','')}</td>
+          <td class="p-3 font-medium">${r.veg_name}</td>
+          <td class="p-3">${r.raw_weight}</td>
+          <td class="p-3 text-emerald-600 font-semibold">${r.good_weight || '-'}</td>
+          <td class="p-3 text-rose-500">${r.waste_weight || '-'}</td>
+          <td class="p-3 font-bold text-blue-600">${r.yield_pct ? r.yield_pct + '%' : '-'}</td>
+          <td class="p-3">
+             ${r.status === 'COMPLETED' ? `<span class="px-2 py-0.5 rounded text-xs font-bold bg-slate-100 border">เกรด ${r.grade || '?'}</span>` : '<span class="text-amber-500 text-xs">กำลังผลิต</span>'}
+          </td>
+          <td class="p-3 text-center">
+            ${r.status === 'IN_PROGRESS' ? `<button onclick="promptComplete('${r.lot_id}')" class="text-xs bg-blue-50 text-blue-600 px-3 py-1.5 rounded-lg border border-blue-200 hover:bg-blue-100 font-medium shadow-sm">ปิดยอด (บันทึก Yield)</button>` : ''}
+          </td>
+        </tr>
+      `).join('');
+      document.getElementById('pageInfo').innerText = `แสดงหน้า ${data.page} จาก ${data.totalPages || 1}`;
+    }
 
-      lotSheet.getRange(i + 1, 5, 1, 10).setValues([[
-        endTime.toISOString(), workers, rawWeight, goodWeight, wasteWeight,
-        Number(diff.toFixed(2)), Number(yieldPct.toFixed(2)), Number(rate.toFixed(2)),
-        Number(efficiency.toFixed(2)), "COMPLETED"
-      ]]);
+    function changePage(delta) {
+      currentPage = Math.max(1, currentPage + delta);
+      loadLots(currentPage);
+    }
 
-      return {
-        status: "success", lot_id: p.lot_id, yield_pct: yieldPct.toFixed(2),
-        standard_yield: standardYieldMin, grade: gradeResult.grade
+    async function loadVegDropdown() {
+      const data = await apiRequest(`${API_URL}?action=getVegetables`);
+      if(data && data.status === 'success') {
+        vegListMaster = data.data;
+        document.getElementById('newLotVeg').innerHTML = vegListMaster.map(v => `<option value="${v.veg_id}">${v.veg_name}</option>`).join('');
+      }
+    }
+
+    function openModalCreateLot() {
+      tempBaskets = [];
+      renderBasketTemp();
+      document.getElementById('modalLot').classList.remove('hidden');
+      startScanner();
+    }
+
+    function closeModalCreateLot() {
+      document.getElementById('modalLot').classList.add('hidden');
+      if (html5QrScanner) {
+        html5QrScanner.clear().catch(error => console.error("Failed to clear scanner.", error));
+      }
+    }
+
+    function startScanner() {
+      if(html5QrScanner) return; // ทำงานอยู่แล้ว
+      html5QrScanner = new Html5QrcodeScanner("qr-reader", { fps: 10, qrbox: {width: 200, height: 200} });
+      html5QrScanner.render((decodedText) => {
+        if (decodedText.length >= 8) {
+          document.getElementById('basketInput').value = decodedText;
+          // สามารถสั่งสั่นหรือเล่นเสียงเมื่อสแกนติดได้
+        }
+      });
+    }
+
+    function addBasketItem() {
+      const code = document.getElementById('basketInput').value.trim();
+      const sup = document.getElementById('supplierInput').value.trim();
+      const wt = parseFloat(document.getElementById('weightInput').value);
+
+      if (code.length < 8 || !sup || isNaN(wt)) {
+        alert("กรุณากรอกข้อมูลให้ครบ: รหัสตะกร้า 8 หลัก, ชื่อ Supplier และ น้ำหนัก");
+        return;
+      }
+      tempBaskets.push({ basket_code: code, supplier_name: sup, raw_weight: wt });
+      renderBasketTemp();
+      
+      // ล้างช่องกรอกเพื่อรอตะกร้าต่อไป
+      document.getElementById('basketInput').value = "";
+      document.getElementById('weightInput').value = "";
+    }
+
+    function renderBasketTemp() {
+      document.getElementById('basketTempList').innerHTML = tempBaskets.map((b, i) => `
+        <tr class="bg-white">
+          <td class="p-2 font-mono font-bold text-slate-500">${b.basket_code}</td>
+          <td class="p-2">${b.supplier_name}</td>
+          <td class="p-2 text-right text-emerald-600 font-semibold">${b.raw_weight} kg</td>
+          <td class="p-2 text-right"><button onclick="removeTempBasket(${i})" class="text-rose-500 font-bold">x</button></td>
+        </tr>
+      `).join('');
+    }
+
+    function removeTempBasket(index) {
+      tempBaskets.splice(index, 1);
+      renderBasketTemp();
+    }
+
+    async function submitNewLot() {
+      const sel = document.getElementById('newLotVeg');
+      if(tempBaskets.length === 0) {
+        alert("กรุณาเพิ่มตะกร้าสินค้าเข้า Lot อย่างน้อย 1 ใบ");
+        return;
+      }
+
+      const payload = {
+        action: "createLot",
+        payload: {
+          veg_id: sel.value,
+          veg_name: sel.options[sel.selectedIndex].text,
+          workers_count: document.getElementById('newLotWorkers').value,
+          baskets: tempBaskets
+        }
       };
+
+      const res = await apiRequest(API_URL, 'POST', payload);
+      if(res.status === 'success') {
+        closeModalCreateLot();
+        loadLots(currentPage);
+      }
     }
-  }
-  return { status: "error", message: "Lot not found" };
-}
 
-// ==========================================
-// 4. แดชบอร์ด การจัดอันดับ และ PAGINATION
-// ==========================================
+    async function promptComplete(lotId) {
+      const good = prompt("🥬 ระบุน้ำหนักผักดีที่ได้ (kg):");
+      if(good === null) return;
+      const waste = prompt("🗑️ ระบุน้ำหนักของเสีย (kg):");
+      if(waste === null) return;
 
-function calculateDashboardData(period) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const lots = ss.getSheetByName("Production_Lots").getDataRange().getValues();
+      const payload = {
+        action: "completeLot",
+        payload: { lot_id: lotId, good_weight: parseFloat(good)||0, waste_weight: parseFloat(waste)||0 }
+      };
 
-  let totalRaw = 0, totalGood = 0, totalWaste = 0;
-  const vegMap = {};
-
-  for (let i = 1; i < lots.length; i++) {
-    const row = lots[i];
-    if (row[13] !== "COMPLETED") continue;
-
-    const vName = row[2];
-    const raw = Number(row[6]) || 0;
-    const good = Number(row[7]) || 0;
-    const waste = Number(row[8]) || 0;
-
-    totalRaw += raw; totalGood += good; totalWaste += waste;
-
-    if (!vegMap[vName]) vegMap[vName] = { raw: 0, good: 0, waste: 0 };
-    vegMap[vName].raw += raw;
-    vegMap[vName].good += good;
-    vegMap[vName].waste += waste;
-  }
-
-  const vegList = Object.keys(vegMap).map(k => ({
-    name: k,
-    raw: vegMap[k].raw,
-    good: vegMap[k].good,
-    waste: vegMap[k].waste,
-    yieldPct: vegMap[k].raw > 0 ? ((vegMap[k].good / vegMap[k].raw) * 100).toFixed(2) : 0
-  }));
-
-  const topProduced = [...vegList].sort((a, b) => b.raw - a.raw);
-  const leastWaste = [...vegList].sort((a, b) => a.waste - b.waste);
-
-  return {
-    status: "success",
-    summary: {
-      totalRaw: totalRaw.toFixed(2),
-      totalGood: totalGood.toFixed(2),
-      totalWaste: totalWaste.toFixed(2),
-      overallYield: totalRaw > 0 ? ((totalGood / totalRaw) * 100).toFixed(2) : 0
-    },
-    topProduced, leastWaste, vegChartData: vegList
-  };
-}
-
-function getSupplierRankings() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const baskets = ss.getSheetByName("Lot_Input_Baskets").getDataRange().getValues();
-  const lots = ss.getSheetByName("Production_Lots").getDataRange().getValues();
-
-  const lotYieldMap = {};
-  for (let i = 1; i < lots.length; i++) {
-    if (lots[i][13] === "COMPLETED") {
-      lotYieldMap[lots[i][0]] = Number(lots[i][10]) || 0;
+      const res = await apiRequest(API_URL, 'POST', payload);
+      if(res.status === 'success') {
+        alert(`ปิดยอดสำเร็จ!\nLot นี้ได้เกรด: ${res.grade}`);
+        loadLots(currentPage);
+      }
     }
-  }
 
-  const supplierStats = {};
-  for (let j = 1; j < baskets.length; j++) {
-    const lotId = baskets[j][1];
-    const supName = baskets[j][3];
-    const weight = Number(baskets[j][4]) || 0;
+    // ==========================================
+    // 3. VEGETABLE MASTER CONTROLLER (ADMIN)
+    // ==========================================
 
-    if (lotYieldMap[lotId] === undefined) continue;
+    async function loadVegetableMaster() {
+      const data = await apiRequest(`${API_URL}?action=getVegetables`);
+      if(!data || data.status !== 'success') return;
 
-    if (!supplierStats[supName]) supplierStats[supName] = { totalWeight: 0, weightedYieldSum: 0 };
-    supplierStats[supName].totalWeight += weight;
-    supplierStats[supName].weightedYieldSum += (lotYieldMap[lotId] * weight);
-  }
-
-  const rankingList = Object.keys(supplierStats).map(name => {
-    const totalW = supplierStats[name].totalWeight;
-    const avgYield = totalW > 0 ? (supplierStats[name].weightedYieldSum / totalW) : 0;
-    const grade = avgYield >= 60 ? "A" : (avgYield >= 50 ? "B" : "C");
-    return {
-      supplier_name: name, total_delivered_kg: totalW.toFixed(2),
-      avg_yield_pct: avgYield.toFixed(2), grade: grade
-    };
-  });
-
-  rankingList.sort((a, b) => b.avg_yield_pct - a.avg_yield_pct);
-  return { status: "success", data: rankingList };
-}
-
-function getLotsPaginated(page, pageSize, period) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName("Production_Lots");
-  if (!sheet) return { status: "success", data: [] };
-
-  const data = sheet.getDataRange().getValues();
-  const rows = data.slice(1).reverse();
-
-  const totalRows = rows.length;
-  const totalPages = Math.ceil(totalRows / pageSize) || 1;
-  const startIdx = (page - 1) * pageSize;
-  const paginatedRows = rows.slice(startIdx, startIdx + pageSize);
-
-  return {
-    status: "success", page: page, pageSize: pageSize,
-    totalPages: totalPages, totalRecords: totalRows,
-    data: paginatedRows.map(r => ({
-      lot_id: r[0], veg_id: r[1], veg_name: r[2], start_datetime: r[3], end_datetime: r[4],
-      workers: r[5], raw_weight: r[6], good_weight: r[7], waste_weight: r[8], diff: r[9],
-      yield_pct: r[10], rate: r[11], efficiency: r[12], status: r[13]
-    }))
-  };
-}
-
-// ==========================================
-// 5. HELPER & INITIALIZE SHEETS (รันเพียง 1 ครั้ง)
-// ==========================================
-
-function getTableData(sheetName) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(sheetName);
-  if (!sheet) return { status: "success", data: [] };
-  const rows = sheet.getDataRange().getValues();
-  if (rows.length <= 1) return { status: "success", data: [] };
-
-  const headers = rows[0];
-  const list = [];
-  for (let i = 1; i < rows.length; i++) {
-    const obj = {};
-    headers.forEach((h, idx) => obj[h] = rows[i][idx]);
-    list.push(obj);
-  }
-  return { status: "success", data: list };
-}
-
-function deleteRowById(sheetName, idColName, idVal) {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(sheetName);
-  const data = sheet.getDataRange().getValues();
-  const idIndex = data[0].indexOf(idColName);
-  for (let i = 1; i < data.length; i++) {
-    if (String(data[i][idIndex]).trim() === String(idVal).trim()) {
-      sheet.deleteRow(i + 1);
-      return { status: "success" };
+      const tbody = document.getElementById('vegMasterTableBody');
+      tbody.innerHTML = data.data.map(v => {
+        const minYield = Number(v.standard_yield_min) || 50;
+        return `
+          <tr class="hover:bg-slate-50 transition">
+            <td class="p-3 font-semibold">${v.veg_name}</td>
+            <td class="p-3"><span class="bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full text-xs font-bold">ขั้นต่ำ ${minYield.toFixed(1)}%</span></td>
+            <td class="p-3 text-center space-x-3">
+              <button onclick="editVeg('${v.veg_id}', '${v.veg_name}', ${minYield})" class="text-xs text-blue-600 hover:underline">แก้ไข</button>
+            </td>
+          </tr>
+        `;
+      }).join('');
     }
-  }
-  return { status: "error", message: "Item not found" };
-}
 
-// 📌 ฟังก์ชันนี้ให้กด "Run (เรียกใช้)" เพียง 1 ครั้งเพื่อสร้างตารางทั้งหมดให้พร้อมใช้งาน
-function setupAllSheets() {
-  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const tables = [
-    { name: "Vegetable_Master", headers: ["veg_id", "veg_name", "standard_yield_min", "is_active"], initialData: [["VEG-001", "ผักกาดขาว", 60.0, true], ["VEG-002", "บรอกโคลี", 55.0, true], ["VEG-003", "คะน้า", 50.0, true]] },
-    { name: "Production_Lots", headers: ["lot_id", "veg_id", "veg_name", "start_datetime", "end_datetime", "workers_count", "total_raw_weight", "total_good_weight", "total_waste_weight", "weight_diff", "lot_yield_pct", "production_rate_kg_hr", "efficiency_kg_man_hr", "status"] },
-    { name: "Lot_Input_Baskets", headers: ["item_id", "lot_id", "basket_code", "supplier_name", "raw_weight", "scan_timestamp"] },
-    { name: "Lot_Outputs", headers: ["output_id", "lot_id", "supplier_name", "good_weight", "waste_weight", "recorded_at"] }
-  ];
-  tables.forEach(t => {
-    let sheet = ss.getSheetByName(t.name);
-    if (!sheet) {
-      sheet = ss.insertSheet(t.name);
-      sheet.appendRow(t.headers);
-      if (t.initialData) t.initialData.forEach(row => sheet.appendRow(row));
+    function openVegModal() {
+      document.getElementById('vegIdInput').value = "";
+      document.getElementById('vegNameInput').value = "";
+      document.getElementById('vegYieldMinInput').value = "50.0";
+      document.getElementById('vegModalTitle').innerText = "เพิ่มชนิดผักใหม่";
+      document.getElementById('modalVeg').classList.remove('hidden');
     }
-  });
-  Logger.log("สร้างตารางทั้งหมดเรียบร้อยแล้ว!");
-}
+
+    function editVeg(id, name, yieldMin) {
+      document.getElementById('vegIdInput').value = id;
+      document.getElementById('vegNameInput').value = name;
+      document.getElementById('vegYieldMinInput').value = yieldMin;
+      document.getElementById('vegModalTitle').innerText = "แก้ไขผัก: " + name;
+      document.getElementById('modalVeg').classList.remove('hidden');
+    }
+
+    function closeVegModal() {
+      document.getElementById('modalVeg').classList.add('hidden');
+    }
+
+    async function submitVegForm() {
+      const id = document.getElementById('vegIdInput').value;
+      const name = document.getElementById('vegNameInput').value.trim();
+      const yieldMin = parseFloat(document.getElementById('vegYieldMinInput').value);
+
+      if (!name || isNaN(yieldMin)) { alert("กรอกข้อมูลให้ครบถ้วน"); return; }
+
+      const res = await apiRequest(API_URL, 'POST', {
+        action: "saveVegetable",
+        payload: { veg_id: id, veg_name: name, standard_yield_min: yieldMin }
+      });
+      if(res.status === 'success') {
+        closeVegModal();
+        loadVegetableMaster();
+      }
+    }
+
+    // Initialize on load
+    window.onload = () => switchTab('dashboard');
+  </script>
+</body>
+</html>
