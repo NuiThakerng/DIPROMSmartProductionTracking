@@ -1,0 +1,130 @@
+<!-- Section 3: หน้าจอจัดการ Master ชนิดผักและเกณฑ์ Yield สำหรับ Admin -->
+<section id="sec-master" class="space-y-6 hidden">
+  <div class="flex justify-between items-center">
+    <div>
+      <h2 class="text-2xl font-bold">จัดการชนิดผัก & เกณฑ์ Yield มาตรฐาน</h2>
+      <p class="text-sm text-slate-500">กำหนดเกณฑ์ Yield ขั้นต่ำ (% Min Yield) แยกตามชนิดผัก เพื่อใช้ตัดเกรดและส่งสัญญาณแจ้งเตือน</p>
+    </div>
+    <button onclick="openVegModal()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded shadow">
+      + เพิ่มชนิดผักใหม่
+    </button>
+  </div>
+
+  <div class="bg-white rounded-lg shadow overflow-x-auto">
+    <table class="w-full text-left text-sm text-slate-600">
+      <thead class="bg-slate-100 text-slate-700 uppercase text-xs">
+        <tr>
+          <th class="p-3">รหัสผัก</th>
+          <th class="p-3">ชื่อชนิดผัก</th>
+          <th class="p-3">เกณฑ์ Yield ขั้นต่ำ (%)</th>
+          <th class="p-3">เกณฑ์ของเสียสูงสุดที่ยอมรับได้ (%)</th>
+          <th class="p-3 text-center">จัดการ</th>
+        </tr>
+      </thead>
+      <tbody id="vegMasterTableBody" class="divide-y"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- Modal: เพิ่ม / แก้ไข ชนิดผักและเกณฑ์ Yield -->
+<div id="modalVeg" class="fixed inset-0 bg-black/50 hidden flex items-center justify-center p-4">
+  <div class="bg-white rounded-lg p-6 max-w-md w-full">
+    <h3 id="vegModalTitle" class="text-lg font-bold mb-4">กำหนดชนิดผักและเกณฑ์มาตรฐาน</h3>
+    <input type="hidden" id="vegIdInput">
+
+    <div class="space-y-4 mb-5">
+      <div>
+        <label class="block text-xs font-semibold mb-1">ชื่อชนิดผัก</label>
+        <input type="text" id="vegNameInput" placeholder="เช่น บรอกโคลี, ผักกาดขาว" class="w-full border p-2 rounded text-sm">
+      </div>
+      <div>
+        <label class="block text-xs font-semibold mb-1">เกณฑ์ Yield มาตรฐานขั้นต่ำ (%)</label>
+        <input type="number" id="vegYieldMinInput" step="0.1" placeholder="เช่น 55.0 (ถ้าของเสีย 45%)" class="w-full border p-2 rounded text-sm">
+        <p class="text-xs text-slate-400 mt-1">*หาก Lot มี Yield ต่ำกว่าค่านี้ ระบบจะตัดเป็นเกรด C และยิงเตือนเข้า LINE ทันที*</p>
+      </div>
+    </div>
+
+    <div class="flex justify-end space-x-2">
+      <button onclick="closeVegModal()" class="px-4 py-2 border rounded text-sm">ยกเลิก</button>
+      <button onclick="submitVegForm()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm font-semibold">บันทึก</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ฟังก์ชันโหลดข้อมูลชนิดผักและเกณฑ์ Yield มาแสดงบนตาราง Admin
+async function loadVegetableMaster() {
+  const res = await fetch(`${API_URL}?action=getVegetables`);
+  const json = await res.json();
+  const tbody = document.getElementById('vegMasterTableBody');
+  
+  tbody.innerHTML = json.data.map(v => {
+    const minYield = Number(v.standard_yield_min) || 50;
+    const maxWaste = (100 - minYield).toFixed(1);
+    return `
+      <tr class="hover:bg-slate-50">
+        <td class="p-3 font-mono font-medium">${v.veg_id}</td>
+        <td class="p-3 font-semibold text-slate-800">${v.veg_name}</td>
+        <td class="p-3 font-bold text-emerald-600">${minYield.toFixed(1)}%</td>
+        <td class="p-3 text-rose-500">${maxWaste}%</td>
+        <td class="p-3 text-center space-x-2">
+          <button onclick="editVeg('${v.veg_id}', '${v.veg_name}', ${minYield})" class="text-xs text-blue-600 hover:underline">แก้ไขเกณฑ์</button>
+          <button onclick="deleteVeg('${v.veg_id}')" class="text-xs text-rose-600 hover:underline">ลบ</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+function openVegModal() {
+  document.getElementById('vegIdInput').value = "";
+  document.getElementById('vegNameInput').value = "";
+  document.getElementById('vegYieldMinInput').value = "55.0";
+  document.getElementById('vegModalTitle').innerText = "เพิ่มชนิดผักใหม่";
+  document.getElementById('modalVeg').classList.remove('hidden');
+}
+
+function editVeg(id, name, yieldMin) {
+  document.getElementById('vegIdInput').value = id;
+  document.getElementById('vegNameInput').value = name;
+  document.getElementById('vegYieldMinInput').value = yieldMin;
+  document.getElementById('vegModalTitle').innerText = "แก้ไขเกณฑ์ Yield: " + name;
+  document.getElementById('modalVeg').classList.remove('hidden');
+}
+
+function closeVegModal() {
+  document.getElementById('modalVeg').classList.add('hidden');
+}
+
+async function submitVegForm() {
+  const id = document.getElementById('vegIdInput').value;
+  const name = document.getElementById('vegNameInput').value.trim();
+  const yieldMin = parseFloat(document.getElementById('vegYieldMinInput').value);
+
+  if (!name || isNaN(yieldMin)) {
+    alert("กรุณาระบุชื่อผักและเกณฑ์ Yield ให้ถูกต้อง");
+    return;
+  }
+
+  await fetch(API_URL, {
+    method: "POST",
+    body: JSON.stringify({
+      action: "saveVegetable",
+      payload: { veg_id: id, veg_name: name, standard_yield_min: yieldMin }
+    })
+  });
+
+  closeVegModal();
+  loadVegetableMaster();
+}
+
+async function deleteVeg(id) {
+  if (confirm("ยืนยันการลบชนิดผักนี้?")) {
+    await fetch(API_URL, {
+      method: "POST",
+      body: JSON.stringify({ action: "deleteVegetable", veg_id: id })
+    });
+    loadVegetableMaster();
+  }
+}
+</script>
